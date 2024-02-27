@@ -6,13 +6,88 @@ typedef unsigned int uint32_t;
 typedef uint32_t size_t;
 
 extern char __bss[], __bss_end[], __stack_top[];
+extern char __free_ram[], __free_ram_end[];
+
+extern char __kernel_base[];
+extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
+
+struct process procs[PROCS_MAX];
+
+struct process *current_proc; // 現在実行中のプロセス
+struct process *idle_proc;    // アイドルプロセス
+
+
+void yield(void);
+
+struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
+                       long arg5, long fid, long eid) {
+    register long a0 __asm__("a0") = arg0;
+    register long a1 __asm__("a1") = arg1;
+    register long a2 __asm__("a2") = arg2;
+    register long a3 __asm__("a3") = arg3;
+    register long a4 __asm__("a4") = arg4;
+    register long a5 __asm__("a5") = arg5;
+    register long a6 __asm__("a6") = fid;
+    register long a7 __asm__("a7") = eid;
+
+    __asm__ __volatile__("ecall"
+                         : "=r"(a0), "=r"(a1)
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5),
+                           "r"(a6), "r"(a7)
+                         : "memory");
+    return (struct sbiret){.error = a0, .value = a1};
+}
+
+void putchar(char ch) {
+    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
+}
+
+long getchar(void) {
+    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
+    return ret.error;
+}
+
+void handle_syscall(struct trap_frame *f) {
+    switch (f->a3) {
+        case SYS_PUTCHAR:
+            putchar(f->a0);
+            break;
+
+        case SYS_GETCHAR:
+            while (1) {
+                long ch = getchar();
+                if (ch >= 0) {
+                    f->a0 = ch;
+                    break;
+                }
+
+                yield();
+            }
+            break;
+
+        case SYS_EXIT:
+            printf("process %d exited\n", current_proc->pid);
+            current_proc->state = PROC_EXITED;
+            yield();
+            PANIC("unreachable");
+
+        default:
+            PANIC("unexpected syscall a3=%x\n", f->a3);
+    }
+}
 
 void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
     uint32_t user_pc = READ_CSR(sepc);
+    if (scause == SCAUSE_ECALL) {
+        handle_syscall(f);
+        user_pc += 4;
+    } else {
+        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+    }
 
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+    WRITE_CSR(sepc, user_pc);
 }
 
 __attribute__((naked))
@@ -103,30 +178,8 @@ void kernel_entry(void) {
     );
 }
 
-struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
-                       long arg5, long fid, long eid) {
-    register long a0 __asm__("a0") = arg0;
-    register long a1 __asm__("a1") = arg1;
-    register long a2 __asm__("a2") = arg2;
-    register long a3 __asm__("a3") = arg3;
-    register long a4 __asm__("a4") = arg4;
-    register long a5 __asm__("a5") = arg5;
-    register long a6 __asm__("a6") = fid;
-    register long a7 __asm__("a7") = eid;
 
-    __asm__ __volatile__("ecall"
-                         : "=r"(a0), "=r"(a1)
-                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5),
-                           "r"(a6), "r"(a7)
-                         : "memory");
-    return (struct sbiret){.error = a0, .value = a1};
-}
 
-void putchar(char ch) {
-    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
-}
-
-extern char __free_ram[], __free_ram_end[];
 
 paddr_t alloc_pages(uint32_t n) {
     static paddr_t next_paddr = (paddr_t) __free_ram;
@@ -141,7 +194,6 @@ paddr_t alloc_pages(uint32_t n) {
     return paddr;
 }
 
-struct process procs[PROCS_MAX];
 
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
                                            uint32_t *next_sp) {
@@ -200,9 +252,18 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
     table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
 }
 
-extern char __kernel_base[];
+__attribute__((naked)) void user_entry(void) {
+    __asm__ __volatile__(
+        "csrw sepc, %[sepc]\n"
+        "csrw sstatus, %[sstatus]\n"
+        "sret\n"
+        :
+        : [sepc] "r" (USER_BASE),
+          [sstatus] "r" (SSTATUS_SPIE)
+    );
+}
 
-struct process *create_process(uint32_t pc) {
+struct process *create_process(const void *image, size_t image_size) {
     // 空いているプロセス管理構造体を探す
     struct process *proc = NULL;
     int i;
@@ -230,7 +291,7 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s2
     *--sp = 0;                      // s1
     *--sp = 0;                      // s0
-    *--sp = (uint32_t) pc;          // ra
+    *--sp = (uint32_t) user_entry;  // ra
 
     uint32_t *page_table = (uint32_t *) alloc_pages(1);
 
@@ -238,6 +299,14 @@ struct process *create_process(uint32_t pc) {
     for (paddr_t paddr = (paddr_t) __kernel_base;
          paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) {
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
+
+    // ユーザーのページをマッピングする
+    for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
+        paddr_t page = alloc_pages(1);
+        memcpy((void *) page, image + off, PAGE_SIZE);
+        map_page(page_table, USER_BASE + off, page,
+                 PAGE_U | PAGE_R | PAGE_W | PAGE_X);
     }
 
     // 各フィールドを初期化
@@ -248,9 +317,6 @@ struct process *create_process(uint32_t pc) {
     return proc;
 }
 
-
-struct process *current_proc; // 現在実行中のプロセス
-struct process *idle_proc;    // アイドルプロセス
 
 void yield(void) {
     // 実行可能なプロセスを探す
@@ -317,6 +383,13 @@ void kernel_main(void) {
 
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
 
+    idle_proc = create_process(NULL, 0);
+    idle_proc->pid = -1; // idle
+    current_proc = idle_proc;
+
+    create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
+
+    yield();
     PANIC("switched to idle process");
 
 }
